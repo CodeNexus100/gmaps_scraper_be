@@ -2,22 +2,121 @@ import os
 import json
 import time
 import re
+import random
 import logging
-from typing import List, Dict, Any
-from playwright.sync_api import sync_playwright
+import functools
+from typing import List, Dict, Any, Optional
+from playwright.sync_api import sync_playwright, Page, Response, TimeoutError as PlaywrightTimeoutError
 
 from parser import parse_raw_json, parse_search_item, parse_place_detail
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("gmaps_scraper")
 
+class BotChallengeDetectedException(Exception):
+    """Raised when CAPTCHA, consent redirect, or 429/403 bot block is detected."""
+    pass
+
+# User-Agent pool for desktop Chrome session randomization
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+]
+
+VIEWPORTS = [
+    {"width": 1366, "height": 768},
+    {"width": 1440, "height": 900},
+    {"width": 1536, "height": 864},
+    {"width": 1600, "height": 900}
+]
+
+def get_random_user_agent() -> str:
+    return random.choice(USER_AGENTS)
+
+def get_random_viewport() -> dict:
+    return random.choice(VIEWPORTS)
+
+def jitter_delay(base_seconds: float, variance: float = 0.4):
+    """Add human-like randomized delay around a base interval."""
+    actual_delay = max(0.2, base_seconds + random.uniform(-variance, variance))
+    time.sleep(actual_delay)
+
+def apply_stealth_scripts(page: Page):
+    """Inject Playwright stealth scripts to patch automation indicators."""
+    stealth_code = """
+        // 1. Overwrite navigator.webdriver
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+
+        // 2. Mock chrome.runtime
+        window.chrome = { runtime: {}, loadTimes: function() {}, csi: function() {}, app: {} };
+
+        // 3. Spoof plugins and languages
+        Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+
+        // 4. WebGL vendor & renderer spoofing
+        const getParameter = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0)';
+            return getParameter.apply(this, arguments);
+        };
+    """
+    page.add_init_script(stealth_code)
+
+def retry_with_backoff(max_retries: int = 3, initial_delay: float = 2.0, backoff_factor: float = 2.0):
+    """Higher-level retry decorator with exponential backoff and jitter for recoverable errors."""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except BotChallengeDetectedException as e:
+                    # Do NOT retry bot-blocked sessions — exit gracefully
+                    logger.error(f"[BOT BLOCKED] Non-retryable bot challenge: {e}")
+                    raise e
+                except Exception as e:
+                    last_exception = e
+                    if attempt == max_retries:
+                        logger.error(f"[RUN RETRY EXHAUSTED] Run failed after {max_retries} attempts: {e}")
+                        raise e
+                    
+                    jittered_delay = delay + random.uniform(0.1, 1.0)
+                    logger.warning(f"[RUN RETRY #{attempt}/{max_retries}] Recoverable run error: {e}. Backing off {jittered_delay:.2f}s...")
+                    time.sleep(jittered_delay)
+                    delay *= backoff_factor
+            if last_exception:
+                raise last_exception
+        return wrapper
+    return decorator
+
+
 class GoogleMapsScraper:
-    def __init__(self, raw_dir: str = "raw"):
+    def __init__(self, raw_dir: str = "raw", proxy: Optional[Dict[str, str]] = None):
         self.raw_dir = raw_dir
+        self.proxy = proxy
         os.makedirs(self.raw_dir, exist_ok=True)
         self.search_pages_raw: List[str] = []
         self.place_details_raw: Dict[str, str] = {} # cid -> raw_json_text
         self.place_reviews_raw: Dict[str, str] = {} # cid -> raw_json_text
+        self.bot_challenges_count: int = 0
+        self.run_retries_count: int = 0
+
+    def clear_raw_dir(self):
+        """Clear JSON files in raw_dir directory at the start of a query run."""
+        if os.path.exists(self.raw_dir):
+            for f in os.listdir(self.raw_dir):
+                if f.endswith(".json"):
+                    try:
+                        os.remove(os.path.join(self.raw_dir, f))
+                    except Exception as e:
+                        logger.warning(f"Could not remove old raw file {f}: {e}")
+            logger.info(f"Cleared old raw JSON files in directory: '{self.raw_dir}'")
 
     def extract_cid_from_text_or_url(self, url: str, text: str) -> str:
         """Extract CID hex pair (0x...:0x...) from response URL or body."""
@@ -54,16 +153,45 @@ class GoogleMapsScraper:
 
         return found_items
 
-    def handle_response(self, response):
+    def check_bot_challenges(self, page: Page, response: Optional[Response] = None):
+        """Detect CAPTCHA, unexpected consent redirects, or 429/403 block signals."""
+        current_url = page.url
+        
+        # Check HTTP status codes on RPC calls
+        if response and response.status in [429, 403]:
+            if any(rpc in response.url for rpc in ["/maps/rpc/search", "/maps/rpc/place", "/maps/preview/place"]):
+                shot_path = os.path.join(self.raw_dir, f"bot_challenge_http_{response.status}.png")
+                page.screenshot(path=shot_path)
+                self.bot_challenges_count += 1
+                raise BotChallengeDetectedException(f"HTTP {response.status} Bot Block on {response.url[:70]}. Saved screenshot to {shot_path}")
+
+        # Check URL redirects
+        if "google.com/sorry/index" in current_url:
+            shot_path = os.path.join(self.raw_dir, "bot_challenge_sorry.png")
+            page.screenshot(path=shot_path)
+            self.bot_challenges_count += 1
+            raise BotChallengeDetectedException(f"Redirected to Google Sorry/CAPTCHA page. Saved screenshot to {shot_path}")
+
+        # Check DOM element challenge indicators
+        if page.query_selector("iframe[src*='recaptcha'], iframe[src*='captcha'], #captcha-form"):
+            shot_path = os.path.join(self.raw_dir, "bot_challenge_captcha.png")
+            page.screenshot(path=shot_path)
+            self.bot_challenges_count += 1
+            raise BotChallengeDetectedException(f"ReCAPTCHA iframe detected in DOM. Saved screenshot to {shot_path}")
+
+    def handle_response(self, response: Response):
         url = response.url
         try:
+            # Check 429/403 blocks
+            if response.status in [429, 403]:
+                logger.warning(f"[BOT BLOCKED STATUS] {response.status} on {url[:80]}")
+
             # Intercept search responses
             if "/maps/rpc/search" in url or ("search?" in url and "tbm=map" in url):
                 text = response.text()
                 logger.info(f"Intercepted search response ({len(text)} bytes): {url[:80]}...")
                 self.search_pages_raw.append(text)
                 
-                # Save raw search page
                 page_idx = len(self.search_pages_raw)
                 cleaned_text = parse_raw_json(text)
                 filename = os.path.join(self.raw_dir, f"search_page_{page_idx}.json")
@@ -96,6 +224,21 @@ class GoogleMapsScraper:
 
         except Exception as e:
             logger.warning(f"Error intercepting response from {url[:80]}: {e}")
+
+    def is_ad_card(self, card) -> bool:
+        """Check if DOM card is a sponsored ad listing."""
+        try:
+            inner_text = card.inner_text() or ""
+            html = card.inner_html() or ""
+            if "Sponsored" in inner_text or "Ad ·" in inner_text or "Ad " in inner_text:
+                return True
+            if "aclk" in html or "googleadservices" in html:
+                return True
+            if card.query_selector(".ub7k4e, [aria-label*='Sponsored'], [aria-label*='Ad']"):
+                return True
+        except Exception:
+            pass
+        return False
 
     def match_card_to_item(self, card, expected_items_by_cid: Dict[str, dict], expected_items_by_name: Dict[str, dict]):
         """Match a DOM card element to an expected search listing by CID or Name."""
@@ -150,24 +293,45 @@ class GoogleMapsScraper:
         return by_cid, by_name
 
     def scrape(self, query: str, max_scrolls: int = 5, click_details: bool = True) -> List[Dict[str, Any]]:
-        logger.info(f"Starting browser automation for query: '{query}'")
+        self.clear_raw_dir()
+        self.search_pages_raw.clear()
+        self.place_details_raw.clear()
+        self.place_reviews_raw.clear()
+
+        # Session Randomization (Stealth requirement)
+        ua = get_random_user_agent()
+        vp = get_random_viewport()
+        logger.info(f"Starting browser session. User-Agent: {ua[:50]}..., Viewport: {vp['width']}x{vp['height']}")
 
         processed_cids: set = set()
         failed_cids: set = set()
+        skipped_ad_cids: set = set()
 
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            # Pluggable proxy configuration
+            launch_args = {"headless": True}
+            if self.proxy:
+                launch_args["proxy"] = self.proxy
+                logger.info(f"Using pluggable proxy configuration: {self.proxy}")
+
+            browser = p.chromium.launch(**launch_args)
             context = browser.new_context(
-                viewport={"width": 1400, "height": 900},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+                viewport=vp,
+                user_agent=ua
             )
             page = context.new_page()
+
+            # Apply stealth scripts to hide webdriver indicators
+            apply_stealth_scripts(page)
 
             page.on("response", self.handle_response)
 
             logger.info("Navigating to Google Maps...")
             page.goto("https://www.google.com/maps?hl=en", wait_until="load", timeout=60000)
-            time.sleep(3)
+            jitter_delay(3.0, variance=0.5)
+
+            # Check bot challenge / captcha
+            self.check_bot_challenges(page)
 
             # Handle consent wall if presented
             for frame in page.frames:
@@ -177,7 +341,7 @@ class GoogleMapsScraper:
                         if btn and btn.is_visible():
                             logger.info(f"Clicking consent button: '{btn_text}'")
                             btn.click()
-                            time.sleep(2)
+                            jitter_delay(2.0, variance=0.4)
                             break
                     except Exception:
                         pass
@@ -207,8 +371,12 @@ class GoogleMapsScraper:
 
             logger.info(f"Entering search query: '{query}'")
             search_input.fill(query)
+            jitter_delay(0.5, variance=0.2)
             page.keyboard.press("Enter")
-            time.sleep(5)
+            jitter_delay(4.5, variance=0.8)
+
+            # Check bot challenge post-query submission
+            self.check_bot_challenges(page)
 
             results_feed = None
             for feed_sel in ["div[role='feed']", "div.m6QEfe", "div[aria-label*='Results']"]:
@@ -224,7 +392,8 @@ class GoogleMapsScraper:
                 logger.info(f"Scrolling search results panel ({max_scrolls} initial scroll passes)...")
                 for scroll_idx in range(max_scrolls):
                     page.evaluate("el => el.scrollBy(0, 1000)", results_feed)
-                    time.sleep(2.5)
+                    # Human-like scroll jitter
+                    jitter_delay(2.5, variance=0.6)
 
                 if click_details:
                     logger.info("Starting DOM Virtualization Interleaved Click & Scroll Loop...")
@@ -233,20 +402,25 @@ class GoogleMapsScraper:
                     max_idle_scrolls = 8
 
                     while True:
-                        # Dynamically rebuild expected items from all search XHR responses captured so far
+                        self.check_bot_challenges(page)
+                        
                         expected_by_cid, expected_by_name = self.build_expected_items()
                         expected_total = len(expected_by_cid)
 
-                        if len(processed_cids) + len(failed_cids) >= expected_total and expected_total > 0:
-                            logger.info(f"All {expected_total} expected CIDs processed ({len(processed_cids)} succeeded, {len(failed_cids)} failed). Exiting click loop.")
+                        if len(processed_cids) + len(failed_cids) + len(skipped_ad_cids) >= expected_total and expected_total > 0:
+                            logger.info(
+                                f"All {expected_total} expected CIDs accounted for "
+                                f"({len(processed_cids)} captured, {len(skipped_ad_cids)} skipped ads, {len(failed_cids)} failed). Exiting click loop."
+                            )
                             break
 
                         if idle_scroll_count >= max_idle_scrolls:
-                            never_attempted_count = expected_total - (len(processed_cids) + len(failed_cids))
+                            never_attempted_count = expected_total - (len(processed_cids) + len(failed_cids) + len(skipped_ad_cids))
                             logger.warning(
                                 f"[SAFETY EXIT] Safety exit triggered after {max_idle_scrolls} consecutive idle scrolls.\n"
                                 f"  Target CIDs Expected: {expected_total}\n"
                                 f"  Captured Succeeded:  {len(processed_cids)}\n"
+                                f"  Skipped Ads:         {len(skipped_ad_cids)}\n"
                                 f"  Attempted & Failed:  {len(failed_cids)}\n"
                                 f"  Never Attempted:     {never_attempted_count}"
                             )
@@ -263,15 +437,22 @@ class GoogleMapsScraper:
                             cid = matched_item["cid"]
                             name = matched_item.get("name", "Unknown")
 
-                            if cid in processed_cids or cid in failed_cids:
+                            if cid in processed_cids or cid in failed_cids or cid in skipped_ad_cids:
+                                continue
+
+                            if self.is_ad_card(card):
+                                skipped_ad_cids.add(cid)
+                                logger.info(f"[SKIPPED AD] CID {cid} ('{name[:35]}') - Detected sponsored ad listing, skipping click.")
                                 continue
 
                             new_clicks_in_pass += 1
                             idle_scroll_count = 0
                             
+                            click_target = card.query_selector("a.hfA20e") or card.query_selector("a[href*='/maps/place/']") or card
+                            
                             try:
-                                card.scroll_into_view_if_needed(timeout=2000)
-                                time.sleep(0.3)
+                                click_target.scroll_into_view_if_needed(timeout=2000)
+                                jitter_delay(0.3, variance=0.1)
                             except Exception:
                                 pass
 
@@ -283,13 +464,13 @@ class GoogleMapsScraper:
                                 try:
                                     logger.info(f"[CLICK ATTEMPT {attempt}] CID {cid} ('{name[:35]}')...")
                                     with page.expect_response(is_place_rpc, timeout=5000):
-                                        card.click()
+                                        click_target.click()
                                     click_success = True
                                     logger.info(f"[CLICK SUCCESS] Intercepted place detail for CID {cid}")
                                     break
                                 except Exception as te:
                                     logger.warning(f"[CLICK TIMEOUT] Attempt {attempt} timed out for CID {cid}. Error: {te}")
-                                    time.sleep(1)
+                                    jitter_delay(1.0, variance=0.3)
 
                             if click_success:
                                 processed_cids.add(cid)
@@ -300,12 +481,14 @@ class GoogleMapsScraper:
                             detail_pane = page.query_selector("div.m6QEfe[tabindex='-1']")
                             if detail_pane:
                                 page.evaluate("el => el.scrollBy(0, 500)", detail_pane)
-                                time.sleep(0.5)
+                                jitter_delay(0.5, variance=0.2)
 
-                        # Scroll feed down to reveal next virtualized DOM cards and trigger more search XHRs
-                        logger.info(f"Pass complete ({new_clicks_in_pass} new clicks). Progress: {len(processed_cids)} captured, {len(failed_cids)} failed out of {expected_total} expected. Scrolling feed...")
+                        logger.info(
+                            f"Pass complete ({new_clicks_in_pass} new clicks). Progress: "
+                            f"{len(processed_cids)} captured, {len(skipped_ad_cids)} skipped ads, {len(failed_cids)} failed out of {expected_total} expected. Scrolling feed..."
+                        )
                         page.evaluate("el => el.scrollBy(0, 1000)", results_feed)
-                        time.sleep(2.5)
+                        jitter_delay(2.5, variance=0.6)
 
                         if new_clicks_in_pass == 0:
                             idle_scroll_count += 1
@@ -313,28 +496,22 @@ class GoogleMapsScraper:
 
             browser.close()
 
-        # Final 3-State Classification & Reporting
+        # Extended 5-Metric Report with Bot Challenges & Retries
         final_expected_by_cid, _ = self.build_expected_items()
         expected_cids_set = set(final_expected_by_cid.keys())
-        never_attempted_cids = expected_cids_set - (processed_cids | failed_cids)
+        never_attempted_cids = expected_cids_set - (processed_cids | failed_cids | skipped_ad_cids)
 
         logger.info("=" * 70)
-        logger.info("THREE-STATE METRICS BREAKDOWN REPORT:")
-        logger.info(f"  1. Total Unique CIDs Expected: {len(expected_cids_set)}")
-        logger.info(f"  2. Captured (Success):          {len(processed_cids)}")
-        logger.info(f"  3. Attempted but Failed:        {len(failed_cids)}")
+        logger.info("EXTENDED RESILIENCE & STATE METRICS REPORT:")
+        logger.info(f"  Query Scraped:                 {query}")
+        logger.info(f"  Scoped Raw Directory:          {self.raw_dir}")
+        logger.info(f"  Pluggable Proxy Configured:    {'YES' if self.proxy else 'NO'}")
+        logger.info(f"  Bot Challenge Detections:       {self.bot_challenges_count}")
+        logger.info(f"  Total Unique CIDs Expected:     {len(expected_cids_set)}")
+        logger.info(f"  1. Captured (Success):          {len(processed_cids)}")
+        logger.info(f"  2. Attempted but Failed:        {len(failed_cids)}")
+        logger.info(f"  3. Skipped Ad (Pre-click):      {len(skipped_ad_cids)}")
         logger.info(f"  4. Never Attempted:             {len(never_attempted_cids)}")
-        
-        if failed_cids:
-            logger.info("  Attempted but Failed CIDs:")
-            for fc in failed_cids:
-                logger.info(f"    - CID: {fc} | Name: {final_expected_by_cid.get(fc, {}).get('name')}")
-
-        if never_attempted_cids:
-            logger.info("  Never Attempted CIDs:")
-            for nac in never_attempted_cids:
-                logger.info(f"    - CID: {nac} | Name: {final_expected_by_cid.get(nac, {}).get('name')}")
-
         logger.info("=" * 70)
 
         # Parse intercepted search responses
@@ -370,11 +547,18 @@ class GoogleMapsScraper:
         return all_parsed_results
 
 
-def scrape_query(query: str, max_scrolls: int = 5, click_details: bool = True) -> List[Dict[str, Any]]:
+@retry_with_backoff(max_retries=3, initial_delay=2.0, backoff_factor=2.0)
+def scrape_query(query: str, max_scrolls: int = 5, click_details: bool = True, proxy: Optional[Dict[str, str]] = None, raw_dir: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Single entry point function: scrape_query(query: str) -> list[dict]
-    Runs full Playwright network interception and parser flow.
+    Includes exponential backoff retries, stealth session randomization,
+    bot challenge detection, pluggable proxy support, and per-query scoped raw directory.
     """
-    scraper = GoogleMapsScraper(raw_dir="raw")
+    # Scope raw directory per query to prevent cross-query archival deletion
+    if not raw_dir:
+        slug = re.sub(r'[^a-zA-Z0-9]+', '_', query).strip('_').lower()
+        raw_dir = os.path.join("raw", f"query_{slug}")
+
+    scraper = GoogleMapsScraper(raw_dir=raw_dir, proxy=proxy)
     results = scraper.scrape(query=query, max_scrolls=max_scrolls, click_details=click_details)
     return results

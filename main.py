@@ -8,19 +8,17 @@ def safe_str(s):
         return "None"
     return str(s).encode("ascii", "replace").decode("ascii")
 
-def main():
-    query = "travel agencies in Delhi"
-    if len(sys.argv) > 1:
-        query = " ".join(sys.argv[1:])
+def run_single_query(query: str):
+    print("=" * 70)
+    print(f"=== RUNNING QUERY: '{query}' ===")
+    print("=" * 70)
+    
+    results = scrape_query(query, max_scrolls=3, click_details=True)
 
-    print(f"=== Running Google Maps Scraper for: '{query}' ===")
-    results = scrape_query(query, max_scrolls=4, click_details=True)
+    print(f"\nSuccessfully scraped {len(results)} total listings for query '{query}'.")
+    print(f"Displaying parsed output for top 3 listings:\n")
 
-    print(f"\nSuccessfully scraped {len(results)} total listings.")
-    print("=" * 60)
-    print(f"Displaying parsed output for top 5 listings:\n")
-
-    for idx, listing in enumerate(results[:5], 1):
+    for idx, listing in enumerate(results[:3], 1):
         print(f"--- LISTING #{idx} ---")
         print(f"Name:         {safe_str(listing.get('name'))}")
         print(f"CID:          {safe_str(listing.get('cid'))}")
@@ -32,31 +30,32 @@ def main():
         print(f"Detail Phone: {safe_str(detail.get('phone'))}")
         print(f"Detail Web:   {safe_str(detail.get('website'))}")
         print(f"Detail Addr:  {safe_str(detail.get('full_address'))}")
-        hours = detail.get('hours')
-        if isinstance(hours, dict):
-            print("Detail Hours:")
-            for day, sched in hours.items():
-                print(f"  - {day}: {safe_str(sched)}")
-        else:
-            print(f"Detail Hours: {safe_str(hours)}")
         print()
 
-    # Verify raw JSON files saved
-    raw_files = [f for f in os.listdir("raw") if f.endswith(".json")] if os.path.exists("raw") else []
-    place_files = [f for f in raw_files if f.startswith("place_")]
-    search_files = [f for f in raw_files if f.startswith("search_page_")]
+    raw_subdirs = [d for d in os.listdir("raw") if os.path.isdir(os.path.join("raw", d))] if os.path.exists("raw") else []
+    print(f"Raw Scoped Subdirectories on disk: {raw_subdirs}")
+    return results
 
-    print("=" * 60)
-    print(f"Raw Response Archival Verification:")
-    print(f"Total raw search page JSON files: {len(search_files)}")
-    print(f"Total raw place detail JSON files: {len(place_files)}")
-    print(f"Total raw JSON files saved in raw/: {len(raw_files)}")
-    for f in raw_files[:10]:
-        size = os.path.getsize(os.path.join("raw", f))
-        print(f"  - raw/{f} ({size} bytes)")
+def main():
+    queries = ["travel agencies in Delhi", "travel agencies in Mumbai"]
+    if len(sys.argv) > 1:
+        queries = [" ".join(sys.argv[1:])]
 
-    if len(raw_files) > 10:
-        print(f"  ... and {len(raw_files) - 10} more raw JSON files.")
+    print("======================================================================")
+    print("=== MULTI-QUERY SEQUENTIAL SCRAPER VERIFICATION RUN ===")
+    print("======================================================================")
+
+    results_map = {}
+    for q in queries:
+        res = run_single_query(q)
+        results_map[q] = res
+
+    print("\n" + "=" * 70)
+    print("MULTI-QUERY SEQUENTIAL EXECUTION VERIFICATION SUMMARY")
+    print("=" * 70)
+    for q, res in results_map.items():
+        print(f"  - Query: '{q}' -> Extracted {len(res)} total listings.")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
