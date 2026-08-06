@@ -8,53 +8,55 @@ def safe_str(s):
         return "None"
     return str(s).encode("ascii", "replace").decode("ascii")
 
-def run_single_query(query: str):
+def run_test_query(query: str):
+    print("\n" + "=" * 70)
+    print(f"=== TESTING SPARSE-RESULT QUERY: '{query}' ===")
     print("=" * 70)
-    print(f"=== RUNNING QUERY: '{query}' ===")
-    print("=" * 70)
-    
-    results = scrape_query(query, max_scrolls=3, click_details=True)
+
+    results = scrape_query(query, max_scrolls=2, click_details=True)
 
     print(f"\nSuccessfully scraped {len(results)} total listings for query '{query}'.")
-    print(f"Displaying parsed output for top 3 listings:\n")
+    if results:
+        print(f"Displaying parsed output for top 5 listings:\n")
+        for idx, listing in enumerate(results[:5], 1):
+            print(f"--- LISTING #{idx} ---")
+            print(f"Name:         {safe_str(listing.get('name'))}")
+            print(f"CID:          {safe_str(listing.get('cid'))}")
+            print(f"Category:     {safe_str(listing.get('category'))}")
+            print(f"Rating:       {listing.get('rating')} ({listing.get('review_count')} reviews)")
+            print(f"Address:      {safe_str(listing.get('address'))}")
+            detail = listing.get('detail', {})
+            print(f"Detail Phone: {safe_str(detail.get('phone'))}")
+            print(f"Detail Web:   {safe_str(detail.get('website'))}")
+            print(f"Detail Addr:  {safe_str(detail.get('full_address'))}")
+            print()
 
-    for idx, listing in enumerate(results[:3], 1):
-        print(f"--- LISTING #{idx} ---")
-        print(f"Name:         {safe_str(listing.get('name'))}")
-        print(f"CID:          {safe_str(listing.get('cid'))}")
-        print(f"Category:     {safe_str(listing.get('category'))}")
-        print(f"Rating:       {listing.get('rating')} ({listing.get('review_count')} reviews)")
-        print(f"Address:      {safe_str(listing.get('address'))}")
-        print(f"Coordinates:  Lat={listing.get('lat')}, Lng={listing.get('lng')}")
-        detail = listing.get('detail', {})
-        print(f"Detail Phone: {safe_str(detail.get('phone'))}")
-        print(f"Detail Web:   {safe_str(detail.get('website'))}")
-        print(f"Detail Addr:  {safe_str(detail.get('full_address'))}")
-        print()
-
-    raw_subdirs = [d for d in os.listdir("raw") if os.path.isdir(os.path.join("raw", d))] if os.path.exists("raw") else []
-    print(f"Raw Scoped Subdirectories on disk: {raw_subdirs}")
+    slug = query.replace(" ", "_").lower()
+    raw_dir = os.path.join("raw", f"query_{slug}")
+    if os.path.exists(raw_dir):
+        files = os.listdir(raw_dir)
+        search_files = [f for f in files if f.startswith("search_page_")]
+        place_files = [f for f in files if f.startswith("place_")]
+        print("=" * 60)
+        print(f"Raw Archival Summary for '{raw_dir}':")
+        print(f"  - Search Page JSON Files:  {len(search_files)}")
+        print(f"  - Place Detail JSON Files: {len(place_files)}")
+        print(f"  - Total Files in Directory: {len(files)}")
+        print("=" * 60)
     return results
 
 def main():
-    queries = ["travel agencies in Delhi", "travel agencies in Mumbai"]
-    if len(sys.argv) > 1:
-        queries = [" ".join(sys.argv[1:])]
-
     print("======================================================================")
-    print("=== MULTI-QUERY SEQUENTIAL SCRAPER VERIFICATION RUN ===")
+    print("=== GENUINE SPARSE-RESULT EDGE CASE SCRAPER TEST ===")
     print("======================================================================")
 
-    results_map = {}
-    for q in queries:
-        res = run_single_query(q)
-        results_map[q] = res
+    sparse_query = "scuba diving center in Leh"
+    sparse_results = run_test_query(sparse_query)
 
     print("\n" + "=" * 70)
-    print("MULTI-QUERY SEQUENTIAL EXECUTION VERIFICATION SUMMARY")
+    print("SPARSE-RESULT TEST SUMMARY")
     print("=" * 70)
-    for q, res in results_map.items():
-        print(f"  - Query: '{q}' -> Extracted {len(res)} total listings.")
+    print(f"  - Query: '{sparse_query}' -> Extracted {len(sparse_results)} listings.")
     print("=" * 70)
 
 if __name__ == "__main__":
