@@ -307,7 +307,7 @@ def parse_place_detail(raw_json) -> dict:
     # Extract Website
     try:
         def _find_website(obj):
-            if isinstance(obj, str) and obj.startswith("http") and not any(x in obj for x in ["google.com", "ggpht", "gstatic", "googleusercontent"]):
+            if isinstance(obj, str) and obj.startswith("http") and not any(x in obj for x in ["google.com", "ggpht", "gstatic", "googleusercontent", "googleapis.com"]):
                 return obj
             if isinstance(obj, list):
                 for item in obj:

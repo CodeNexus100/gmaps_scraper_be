@@ -299,8 +299,9 @@ class GoogleMapsScraper:
                     by_name[name.strip().lower()] = parsed_item
         return by_cid, by_name
 
-    def scrape(self, query: str, max_scrolls: int = 5, click_details: bool = True) -> List[Dict[str, Any]]:
-        self.clear_raw_dir()
+    def scrape(self, query: str, max_scrolls: int = 5, click_details: bool = True, clear_dir: bool = True) -> List[Dict[str, Any]]:
+        if clear_dir:
+            self.clear_raw_dir()
         self.search_pages_raw.clear()
         self.place_details_raw.clear()
         self.place_reviews_raw.clear()
@@ -637,7 +638,8 @@ def scrape_query(
     click_details: bool = True,
     proxy: Optional[Dict[str, str]] = None,
     raw_dir: Optional[str] = None,
-    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None
+    progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    clear_dir: bool = True
 ) -> List[Dict[str, Any]]:
     """
     Single entry point function: scrape_query(query: str) -> list[dict]
@@ -649,5 +651,5 @@ def scrape_query(
         raw_dir = os.path.join("raw", f"query_{slug}")
 
     scraper = GoogleMapsScraper(raw_dir=raw_dir, proxy=proxy, progress_callback=progress_callback)
-    results = scraper.scrape(query=query, max_scrolls=max_scrolls, click_details=click_details)
+    results = scraper.scrape(query=query, max_scrolls=max_scrolls, click_details=click_details, clear_dir=clear_dir)
     return results

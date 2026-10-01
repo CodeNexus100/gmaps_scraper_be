@@ -4,6 +4,8 @@ import time
 import uuid
 import asyncio
 import logging
+import re
+import random
 from typing import Dict, Any, List, Optional
 from collections import defaultdict
 
@@ -40,6 +42,9 @@ WS_CONNECTIONS: Dict[str, List[WebSocket]] = defaultdict(list)
 class ScrapeRequest(BaseModel):
     query: str
     location_bias: Optional[str] = None
+    bbox: Optional[List[float]] = None
+
+QUADTREE_SUBDIVISION_THRESHOLD = 40  # Trigger subdivision when feed count hits this ceiling
 
 class ScrapeResponse(BaseModel):
     job_id: str
@@ -104,12 +109,86 @@ def run_scrape_background_job(job_id: str, query: str):
         if JOBS[job_id].get("location_bias"):
             full_query = f"{query} in {JOBS[job_id]['location_bias']}"
 
-        results = scrape_query(
-            query=full_query,
-            max_scrolls=5,
-            click_details=True,
-            progress_callback=on_progress
-        )
+        def run_quadtree_scrape(
+            base_query: str, 
+            bbox: List[float], 
+            depth: int = 0, 
+            max_depth: int = 6, 
+            global_state: Dict = None
+        ) -> List[Dict[str, Any]]:
+            if global_state is None:
+                slug = re.sub(r'[^a-zA-Z0-9]+', '_', base_query).strip('_').lower()
+                global_state = {
+                    "results_by_cid": {},
+                    "boxes_searched": 0,
+                    "boxes_queued": 1,
+                    "raw_dir": os.path.join("raw", f"query_quad_{slug}_{uuid.uuid4().hex[:8]}")
+                }
+            
+            os.makedirs(global_state["raw_dir"], exist_ok=True)
+            min_lat, min_lng, max_lat, max_lng = bbox
+            center_lat, center_lng = (min_lat + max_lat) / 2, (min_lng + max_lng) / 2
+            
+            q_near = f"{base_query} near {center_lat},{center_lng}"
+            logger.info(f"[QUADTREE] Depth {depth}: Searching bbox {bbox} with query '{q_near}'")
+            
+            def on_progress_quad(event_data: Dict[str, Any]):
+                extended_data = dict(event_data)
+                extended_data["quadtree"] = {
+                    "depth": depth,
+                    "boxes_searched": global_state["boxes_searched"],
+                    "boxes_queued": global_state["boxes_queued"],
+                    "total_unique_cids": len(global_state["results_by_cid"])
+                }
+                on_progress(extended_data)
+
+            if global_state["boxes_searched"] > 0:
+                time.sleep(random.uniform(2.0, 5.0))
+                
+            global_state["boxes_queued"] -= 1
+            global_state["boxes_searched"] += 1
+
+            try:
+                res = scrape_query(
+                    query=q_near,
+                    max_scrolls=25,
+                    click_details=True,
+                    raw_dir=global_state["raw_dir"],
+                    progress_callback=on_progress_quad,
+                    clear_dir=False
+                )
+            except BotChallengeDetectedException as bce:
+                raise bce
+            except Exception as e:
+                logger.error(f"[QUADTREE] Error searching bbox {bbox}: {e}")
+                res = []
+
+            for r in res:
+                global_state["results_by_cid"][r["cid"]] = r
+
+            if len(res) >= QUADTREE_SUBDIVISION_THRESHOLD and depth < max_depth:
+                logger.info(f"[QUADTREE] Cap reached ({len(res)} >= {QUADTREE_SUBDIVISION_THRESHOLD}) at depth {depth}. Subdividing bbox {bbox} into 4 quadrants.")
+                quads = [
+                    [min_lat, min_lng, center_lat, center_lng],
+                    [min_lat, center_lng, center_lat, max_lng],
+                    [center_lat, min_lng, max_lat, center_lng],
+                    [center_lat, center_lng, max_lat, max_lng]
+                ]
+                global_state["boxes_queued"] += 4
+                for quad in quads:
+                    run_quadtree_scrape(base_query, quad, depth + 1, max_depth, global_state)
+                    
+            return list(global_state["results_by_cid"].values())
+
+        if JOBS[job_id].get("bbox") and len(JOBS[job_id]["bbox"]) == 4:
+            results = run_quadtree_scrape(full_query, JOBS[job_id]["bbox"])
+        else:
+            results = scrape_query(
+                query=full_query,
+                max_scrolls=5,
+                click_details=True,
+                progress_callback=on_progress
+            )
 
         JOBS[job_id]["status"] = "completed"
         JOBS[job_id]["results"] = results
@@ -171,6 +250,7 @@ def start_scrape_job(request: ScrapeRequest, background_tasks: BackgroundTasks):
         "job_id": job_id,
         "query": request.query,
         "location_bias": request.location_bias,
+        "bbox": request.bbox,
         "status": "pending",
         "created_at": now,
         "updated_at": now,
